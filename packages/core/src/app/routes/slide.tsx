@@ -1,0 +1,1367 @@
+import config from 'virtual:open-slide/config';
+import {
+  Check,
+  ChevronDown,
+  ChevronLeft,
+  Download,
+  FileCode2,
+  FileImage,
+  FileText,
+  Link2,
+  Loader2,
+  Maximize,
+  MonitorSpeaker,
+  MoreHorizontal,
+  Play,
+  Presentation,
+  Sparkles,
+  Terminal,
+} from 'lucide-react';
+import {
+  type ReactElement,
+  type RefObject,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { toast } from 'sonner';
+import { AgentToggleButton } from '@/components/agent/agent-dock';
+import { AgentPanel } from '@/components/agent/agent-panel';
+import { AgentPresence } from '@/components/agent/agent-presence';
+import { AssetView } from '@/components/asset-view';
+import { HistoryProvider } from '@/components/history-provider';
+import { CommentLayer } from '@/components/inspector/comment-layer';
+import { InlineEditLayer } from '@/components/inspector/inline-text-editor';
+import { InspectOverlay } from '@/components/inspector/inspect-overlay';
+import {
+  InspectModeSwitcher,
+  InspectorProvider,
+  InspectPanelButton,
+  useInspector,
+} from '@/components/inspector/inspector-provider';
+import { SaveBar } from '@/components/inspector/save-bar';
+import { EditorSidebar } from '@/components/panel/editor-sidebar';
+import { ResizeHandle, useStoredWidth } from '@/components/panel/resize-handle';
+import { DesignProvider } from '@/components/style-panel/design-provider';
+import { DesignToggleButton } from '@/components/style-panel/style-panel';
+import { Button, buttonVariants } from '@/components/ui/button';
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
+  DropdownMenuShortcut,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
+import { setDockOpen, useAgentActivity, useAgentDock } from '@/lib/agent/use-agent';
+import { useFolders } from '@/lib/folders';
+import {
+  hasModifier,
+  isBackwardKey,
+  isForwardKey,
+  isShortcutControlTarget,
+  isTypingTarget,
+} from '@/lib/keys';
+import { readLastHomeLocation } from '@/lib/last-home-location';
+import { useAgentSocketConnected } from '@/lib/use-agent-socket';
+import { useClickPageNavigation } from '@/lib/use-click-page-navigation';
+import { useDocumentTitle } from '@/lib/use-document-title';
+import { useIsMobile } from '@/lib/use-is-mobile';
+import { format, useLocale } from '@/lib/use-locale';
+import { useMediaQuery } from '@/lib/use-media-query';
+import { useWheelPageNavigation } from '@/lib/use-wheel-page-navigation';
+import { cn } from '@/lib/utils';
+import type { AgentTurnContext } from '../../agent/types';
+import { SlideCommandMenu } from '../components/command/slide-command-menu';
+import { PdfProgressToast, PptxProgressToast } from '../components/export-progress-toast';
+import { NotesDrawer } from '../components/notes-drawer';
+import { OverviewGrid } from '../components/overview-grid';
+import { openPresenterWindow, Player } from '../components/player';
+import {
+  afterPaint,
+  CURTAIN_FADE_MS,
+  PresentCurtain,
+  whenFullscreenSettled,
+} from '../components/present/curtain';
+import { SlideCanvas } from '../components/slide-canvas';
+import { isDeckWarmed, markDeckWarmed, SlidePreloadLayer } from '../components/slide-preload-layer';
+import { SlideTransitionLayer } from '../components/slide-transition-layer';
+import { type ThumbnailActions, ThumbnailRail } from '../components/thumbnail-rail';
+import { exportSlideAsHtml } from '../lib/export-html';
+import { exportSlideAsPdf, isSafari, type PdfExportProgress } from '../lib/export-pdf';
+import {
+  exportSlideAsImagePptx,
+  exportSlideAsPptx,
+  type PptxExportProgress,
+} from '../lib/export-pptx';
+import { remapNotesSessionCacheAfterReorder } from '../lib/inspector/use-notes';
+import type { SlideModule } from '../lib/sdk';
+import { usePrefersReducedMotion } from '../lib/use-prefers-reduced-motion';
+import { useSlideModule } from '../lib/use-slide-module';
+
+const { showSlideUi, showSlideBrowser, allowHtmlDownload } = config.build;
+
+const noop = () => {};
+
+export function Slide() {
+  const { slideId = '' } = useParams();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const navigate = useNavigate();
+  // react-router records its entry index in history.state; going back is only
+  // safe when we actually pushed an entry, otherwise land on the last home view.
+  const goBack = useCallback(() => {
+    const idx = (window.history.state as { idx?: number } | null)?.idx ?? 0;
+    if (idx > 0) {
+      navigate(-1);
+    } else {
+      navigate(readLastHomeLocation(), { replace: true });
+    }
+  }, [navigate]);
+  const { slide, error } = useSlideModule(slideId);
+  useDocumentTitle(slide?.meta?.title);
+  const [playMode, setPlayMode] = useState<'window' | 'fullscreen' | null>(null);
+  // Last deck the Player showed. During a presenter-driven deck switch the
+  // route's slideId changes while the new module loads and warms; rendering
+  // from this cache keeps the Player mounted, which preserves fullscreen
+  // (re-entry needs a user gesture) and the elapsed timer.
+  const lastPresentedRef = useRef<{
+    slideId: string;
+    slide: SlideModule;
+    pages: SlideModule['default'];
+    index: number;
+  } | null>(null);
+  const [exporting, setExporting] = useState(false);
+  const [linkCopied, setLinkCopied] = useState(false);
+  const linkCopiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [designOpen, setDesignOpen] = useState(false);
+  const [overviewOpen, setOverviewOpen] = useState(false);
+  const [commandOpen, setCommandOpen] = useState(false);
+  const { open: agentOpen, toggle: toggleAgent } = useAgentDock();
+  useLayoutEffect(() => {
+    if (agentOpen) setDesignOpen(false);
+  }, [agentOpen]);
+  useLayoutEffect(() => {
+    if (designOpen) setDockOpen(false);
+  }, [designOpen]);
+  const [, setWarmedTick] = useState(0);
+  const handleAssetsWarmed = useCallback(() => {
+    markDeckWarmed(slideId);
+    setWarmedTick((n) => n + 1);
+  }, [slideId]);
+
+  useEffect(() => {
+    return () => {
+      if (linkCopiedTimerRef.current) clearTimeout(linkCopiedTimerRef.current);
+    };
+  }, []);
+  const { renameSlide } = useFolders();
+  const slideViewportRef = useRef<HTMLElement>(null);
+  const t = useLocale();
+  const isMobile = useIsMobile();
+  const compactToolbar = useMediaQuery('(max-width: 1023.98px)');
+  const narrowToolbar = useMediaQuery('(max-width: 639.98px)');
+  const prefersReducedMotion = usePrefersReducedMotion();
+
+  // 'entering' darkens the editor before the Player mounts; 'leaving' keeps
+  // the editor dark after the Player unmounts, then fades it back in.
+  const [curtain, setCurtain] = useState<'entering' | 'leaving' | null>(null);
+  const curtainTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (curtainTimerRef.current) clearTimeout(curtainTimerRef.current);
+    },
+    [],
+  );
+  const present = useCallback(
+    (mode: 'window' | 'fullscreen') => {
+      if (prefersReducedMotion) {
+        setPlayMode(mode);
+        return;
+      }
+      if (curtainTimerRef.current) return;
+      setCurtain('entering');
+      // Fullscreen is requested when the Player mounts; the delay stays well
+      // inside the browser's transient user-activation window.
+      curtainTimerRef.current = setTimeout(() => {
+        curtainTimerRef.current = null;
+        setCurtain(null);
+        setPlayMode(mode);
+      }, CURTAIN_FADE_MS);
+    },
+    [prefersReducedMotion],
+  );
+  const exitPresent = useCallback(() => {
+    setPlayMode(null);
+    if (!prefersReducedMotion) setCurtain('leaving');
+  }, [prefersReducedMotion]);
+  useEffect(() => {
+    if (curtain !== 'leaving' || playMode) return;
+    let cancelPaint = () => {};
+    const reveal = () => {
+      cancelPaint = afterPaint(() => setCurtain(null));
+    };
+    if (!document.fullscreenElement) {
+      reveal();
+      return () => cancelPaint();
+    }
+    const cancelWait = whenFullscreenSettled(reveal);
+    return () => {
+      cancelWait();
+      cancelPaint();
+    };
+  }, [curtain, playMode]);
+
+  const modulePages = useMemo(() => slide?.default ?? [], [slide]);
+  const [pages, setPages] = useState<typeof modulePages>(modulePages);
+  useEffect(() => {
+    setPages(modulePages);
+  }, [modulePages]);
+  const pageCount = pages.length;
+  const rawIndex = Number(searchParams.get('p') ?? '1') - 1;
+  const index = Number.isFinite(rawIndex) ? Math.max(0, Math.min(pageCount - 1, rawIndex)) : 0;
+  const view = searchParams.get('view') === 'assets' ? 'assets' : 'slides';
+
+  useEffect(() => {
+    if (!import.meta.hot) return;
+    if (!slideId || !slide || pageCount === 0) return;
+    import.meta.hot.send('open-slide:current', {
+      slideId,
+      pageIndex: index,
+      totalPages: pageCount,
+      slideTitle: slide.meta?.title ?? slideId,
+      view,
+    });
+  }, [slideId, index, pageCount, slide, view]);
+
+  const switchPresentedSlide = useCallback(
+    (id: string) => {
+      navigate(`/s/${encodeURIComponent(id)}`, { replace: true });
+    },
+    [navigate],
+  );
+
+  const goTo = useCallback(
+    (i: number) => {
+      const clamped = Math.max(0, Math.min(pageCount - 1, i));
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          next.set('p', String(clamped + 1));
+          return next;
+        },
+        { replace: true },
+      );
+    },
+    [pageCount, setSearchParams],
+  );
+
+  // While an agent writes this deck page by page, jump to each page as it
+  // lands so the user can follow along.
+  const agentActivity = useAgentActivity(slideId);
+  const agentWriting = agentActivity !== null;
+  const seenPageCount = useRef(pageCount);
+  useEffect(() => {
+    if (agentWriting && pageCount > seenPageCount.current) goTo(pageCount - 1);
+    seenPageCount.current = pageCount;
+  }, [agentWriting, pageCount, goTo]);
+
+  const reorderPage = useCallback(
+    async (from: number, to: number) => {
+      if (from === to) return;
+      const before = pages;
+      const nextPages = [...before];
+      const [moved] = nextPages.splice(from, 1);
+      nextPages.splice(to, 0, moved);
+      setPages(nextPages);
+
+      const order = before.map((_, i) => i);
+      const [movedIdx] = order.splice(from, 1);
+      order.splice(to, 0, movedIdx);
+
+      remapNotesSessionCacheAfterReorder(slideId, order);
+
+      // Keep the user looking at the same page they were on before the drag.
+      let nextIndex = index;
+      if (index === from) nextIndex = to;
+      else if (from < index && to >= index) nextIndex = index - 1;
+      else if (from > index && to <= index) nextIndex = index + 1;
+      if (nextIndex !== index) goTo(nextIndex);
+
+      try {
+        const res = await fetch(`/__slides/${encodeURIComponent(slideId)}/reorder`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ order }),
+        });
+        if (!res.ok) {
+          const detail = await res.json().catch(() => ({ error: res.statusText }));
+          throw new Error(detail.error ?? `HTTP ${res.status}`);
+        }
+      } catch (err) {
+        setPages(before);
+        const inverse = order.map((_, i) => order.indexOf(i));
+        remapNotesSessionCacheAfterReorder(slideId, inverse);
+        toast.error(`Reorder failed: ${String((err as Error).message ?? err)}`);
+      }
+    },
+    [pages, index, slideId, goTo],
+  );
+
+  const duplicatePage = useCallback(
+    async (i: number) => {
+      const before = pages;
+      if (i < 0 || i >= before.length) return;
+      const nextPages = [...before];
+      nextPages.splice(i + 1, 0, before[i]);
+      setPages(nextPages);
+      if (index > i) goTo(index + 1);
+
+      try {
+        const res = await fetch(`/__slides/${encodeURIComponent(slideId)}/pages/${i}/duplicate`, {
+          method: 'POST',
+        });
+        if (!res.ok) {
+          const detail = await res.json().catch(() => ({ error: res.statusText }));
+          throw new Error(detail.error ?? `HTTP ${res.status}`);
+        }
+        toast.success(format(t.thumbnailRail.toastDuplicated, { n: i + 1 }));
+      } catch (err) {
+        setPages(before);
+        toast.error(
+          `${t.thumbnailRail.toastDuplicateFailed}: ${String((err as Error).message ?? err)}`,
+        );
+      }
+    },
+    [pages, index, slideId, goTo, t.thumbnailRail],
+  );
+
+  const deletePage = useCallback(
+    async (i: number) => {
+      const before = pages;
+      if (i < 0 || i >= before.length || before.length <= 1) return;
+      const nextPages = before.slice(0, i).concat(before.slice(i + 1));
+      setPages(nextPages);
+      if (index >= i && index > 0) {
+        const target = index === i ? Math.min(index, nextPages.length - 1) : index - 1;
+        goTo(target);
+      }
+
+      try {
+        const res = await fetch(`/__slides/${encodeURIComponent(slideId)}/pages/${i}`, {
+          method: 'DELETE',
+        });
+        if (!res.ok) {
+          const detail = await res.json().catch(() => ({ error: res.statusText }));
+          throw new Error(detail.error ?? `HTTP ${res.status}`);
+        }
+        toast.success(format(t.thumbnailRail.toastDeleted, { n: i + 1 }));
+      } catch (err) {
+        setPages(before);
+        toast.error(
+          `${t.thumbnailRail.toastDeleteFailed}: ${String((err as Error).message ?? err)}`,
+        );
+      }
+    },
+    [pages, index, slideId, goTo, t.thumbnailRail],
+  );
+
+  const thumbnailActions = useMemo<ThumbnailActions | undefined>(
+    () =>
+      import.meta.env.DEV
+        ? {
+            onDuplicate: duplicatePage,
+            onDelete: deletePage,
+          }
+        : undefined,
+    [duplicatePage, deletePage],
+  );
+
+  useEffect(() => {
+    // When showSlideUi is false the read-only <Player> is rendered and owns
+    // keyboard navigation (including step-aware advance/retreat). Attaching this
+    // page-nav handler too would race it and skip <Steps> reveals, so bail out.
+    if (playMode || curtain || !showSlideUi) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (
+        isTypingTarget(e.target) ||
+        isShortcutControlTarget(e.target) ||
+        e.isComposing ||
+        e.keyCode === 229 ||
+        e.defaultPrevented
+      )
+        return;
+      // Letter shortcuts only fire bare so browser combos (Cmd/Ctrl-P, ⌘F…) stay intact.
+      if (hasModifier(e)) return;
+      // Toggle overview from either state — the overview's own capture-phase
+      // handler doesn't consume O, so this stays consistent open ↔ closed.
+      if (e.key === 'o' || e.key === 'O') {
+        e.preventDefault();
+        setOverviewOpen((v) => !v);
+        return;
+      }
+      // Once overview owns focus, swallow everything else here — its
+      // capture-phase listener drives the focused thumbnail.
+      if (overviewOpen) return;
+      if (isForwardKey(e)) {
+        e.preventDefault();
+        goTo(index + 1);
+        return;
+      }
+      if (isBackwardKey(e)) {
+        e.preventDefault();
+        goTo(index - 1);
+        return;
+      }
+      if (e.key === 'f' || e.key === 'F') {
+        present('fullscreen');
+      } else if (e.key === 'Enter') {
+        present('window');
+      } else if (e.key === 'p' || e.key === 'P') {
+        if (slideId) openPresenterWindow(slideId);
+        present('window');
+      } else if (import.meta.env.DEV && (e.key === 'd' || e.key === 'D')) {
+        setDesignOpen((v) => !v);
+      } else if (import.meta.env.DEV && (e.key === 'a' || e.key === 'A')) {
+        toggleAgent();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [index, goTo, playMode, curtain, slideId, overviewOpen, toggleAgent, present]);
+
+  if (error) {
+    return (
+      <div className="mx-auto max-w-3xl px-8 py-16 text-muted-foreground">
+        {showSlideBrowser && (
+          <Link to="/" className="text-[12px] font-medium text-foreground/70 hover:text-foreground">
+            ← {t.common.home}
+          </Link>
+        )}
+        <span className="mt-6 block eyebrow text-destructive/80">{t.common.loadFailed}</span>
+        <h2 className="mt-2 font-heading text-xl font-semibold tracking-tight text-foreground">
+          {t.common.failedToLoadSlide}
+        </h2>
+        <pre className="mt-4 overflow-auto rounded-[6px] border border-border bg-card p-4 text-[11.5px] leading-relaxed whitespace-pre-wrap shadow-edge">
+          {error}
+        </pre>
+      </div>
+    );
+  }
+
+  const presentReady = Boolean(slide) && pageCount > 0 && isDeckWarmed(slideId);
+  if (playMode && slide && presentReady) {
+    lastPresentedRef.current = { slideId, slide, pages, index };
+  }
+  const presented = playMode
+    ? slide && presentReady
+      ? { slideId, slide, pages, index }
+      : (lastPresentedRef.current ??
+        (slide && pageCount > 0 ? { slideId, slide, pages, index } : null))
+    : null;
+
+  if (playMode && presented) {
+    return (
+      <>
+        <Player
+          pages={presented.pages}
+          design={presented.slide.design}
+          transition={presented.slide.transition}
+          index={presented.index}
+          onIndexChange={presentReady ? goTo : noop}
+          onExit={exitPresent}
+          controls
+          curtain={!prefersReducedMotion}
+          slideId={presented.slideId}
+          onSwitchSlide={switchPresentedSlide}
+          fullscreen={playMode === 'fullscreen'}
+        />
+        {!presentReady && slide && pageCount > 0 && (
+          <SlidePreloadLayer
+            pages={pages}
+            index={index}
+            design={slide.design}
+            includeCurrent
+            onDone={handleAssetsWarmed}
+          />
+        )}
+      </>
+    );
+  }
+
+  if (!slide) {
+    return (
+      <div className="grid min-h-dvh place-items-center px-8 text-muted-foreground">
+        <div className="flex flex-col items-center gap-4">
+          <div className="relative h-px w-56 overflow-hidden bg-hairline">
+            <span
+              aria-hidden
+              className="line-loader-bar absolute inset-y-[-0.5px] left-0 w-1/4 bg-foreground"
+            />
+          </div>
+          <div className="flex flex-wrap items-baseline justify-center gap-x-2 text-[11.5px]">
+            <span className="eyebrow">{t.slide.loadingEyebrow}</span>
+            <span className="font-mono">{slideId}</span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (pageCount === 0) {
+    return (
+      <div className="mx-auto max-w-3xl px-8 py-16 text-muted-foreground">
+        {showSlideBrowser && (
+          <Link to="/" className="text-[12px] font-medium text-foreground/70 hover:text-foreground">
+            ← {t.common.home}
+          </Link>
+        )}
+        <span className="mt-6 block eyebrow">{t.slide.emptyEyebrow}</span>
+        <h2 className="mt-2 font-heading text-xl font-semibold tracking-tight text-foreground">
+          {t.slide.nothingToShow}
+        </h2>
+        <p className="mt-3 text-[13px] leading-relaxed">
+          <code className="rounded-[4px] bg-muted px-1.5 py-0.5 font-mono text-[11.5px]">
+            slides/{slideId}/index.tsx
+          </code>
+          {t.slide.emptyHintMust}
+          <code className="rounded-[4px] bg-muted px-1.5 py-0.5 font-mono text-[11.5px]">
+            export default
+          </code>
+          {t.slide.emptyHintSuffix}
+        </p>
+      </div>
+    );
+  }
+
+  // Hold the loader while a hidden layer warms the whole deck's images and
+  // fonts, so the slide UI first paints with every asset already in cache.
+  if (view !== 'assets' && !isDeckWarmed(slideId)) {
+    return (
+      <div className="grid min-h-dvh place-items-center px-8 text-muted-foreground">
+        <div className="flex flex-col items-center gap-4">
+          <div className="relative h-px w-56 overflow-hidden bg-hairline">
+            <span
+              aria-hidden
+              className="line-loader-bar absolute inset-y-[-0.5px] left-0 w-1/4 bg-foreground"
+            />
+          </div>
+          <div className="flex flex-wrap items-baseline justify-center gap-x-2 text-[11.5px]">
+            <span className="eyebrow">{t.slide.loadingAssetsEyebrow}</span>
+            <span className="font-mono">{slideId}</span>
+          </div>
+        </div>
+        <SlidePreloadLayer
+          pages={pages}
+          index={index}
+          design={slide.design}
+          includeCurrent
+          onDone={handleAssetsWarmed}
+        />
+      </div>
+    );
+  }
+
+  if (!showSlideUi) {
+    return (
+      <Player
+        pages={pages}
+        design={slide.design}
+        transition={slide.transition}
+        index={index}
+        onIndexChange={goTo}
+        onExit={() => {}}
+        allowExit={false}
+      />
+    );
+  }
+
+  const title = slide.meta?.title ?? slideId;
+
+  const copyLink = async () => {
+    try {
+      await navigator.clipboard.writeText(window.location.href);
+      toast.success(t.slide.toastCopyLinkSuccess);
+      setLinkCopied(true);
+      if (linkCopiedTimerRef.current) clearTimeout(linkCopiedTimerRef.current);
+      linkCopiedTimerRef.current = setTimeout(() => setLinkCopied(false), 1200);
+    } catch (err) {
+      console.error('[open-slide] copy link failed', err);
+      toast.error(t.slide.toastCopyLinkFailed);
+    }
+  };
+
+  const exportHtml = async () => {
+    if (!slide || exporting) return;
+    setExporting(true);
+    try {
+      await exportSlideAsHtml(slide, slideId);
+    } catch (err) {
+      console.error('[open-slide] export failed', err);
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  // One toast id drives the whole export: the same id is re-rendered on every
+  // progress tick, swapped for the error toast on failure, then dismissed.
+  const runProgressExport = async <P,>(opts: {
+    kind: string;
+    initial: P;
+    failedMessage: string;
+    renderToast: (progress: P) => ReactElement;
+    run: (onProgress: (progress: P) => void) => Promise<void>;
+  }) => {
+    setExporting(true);
+    const toastId = `${opts.kind}-export-${slideId}`;
+    const show = (progress: P) =>
+      toast.custom(() => opts.renderToast(progress), { id: toastId, duration: Infinity });
+    show(opts.initial);
+    try {
+      await opts.run(show);
+      toast.dismiss(toastId);
+    } catch (err) {
+      console.error(`[open-slide] ${opts.kind} export failed`, err);
+      // Reuses the progress toast's id, so it must outlive this handler.
+      toast.error(opts.failedMessage, { id: toastId, duration: 4000 });
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const exportPdf = async () => {
+    if (!slide || exporting) return;
+    if (isSafari()) {
+      toast.error(t.slide.pdfExportSafariUnsupported, { duration: 5000 });
+      return;
+    }
+    await runProgressExport<PdfExportProgress>({
+      kind: 'pdf',
+      initial: { phase: 'processing', current: 0, total: pages.length, percent: 0 },
+      failedMessage: t.slide.pdfExportFailed,
+      renderToast: (progress) => <PdfProgressToast progress={progress} />,
+      run: (onProgress) => exportSlideAsPdf(slide, slideId, onProgress),
+    });
+  };
+
+  const exportPptx = async () => {
+    if (!slide || exporting) return;
+    await runProgressExport<PptxExportProgress>({
+      kind: 'pptx',
+      initial: { phase: 'processing', current: 0, total: pages.length, percent: 0 },
+      failedMessage: t.slide.pptxExportFailed,
+      renderToast: (progress) => <PptxProgressToast progress={progress} />,
+      run: (onProgress) => exportSlideAsPptx(slide, slideId, onProgress),
+    });
+  };
+
+  const exportImagePptx = async () => {
+    if (!slide || exporting) return;
+    await runProgressExport<PptxExportProgress>({
+      kind: 'pptx',
+      initial: { phase: 'processing', current: 0, total: pages.length, percent: 0 },
+      failedMessage: t.slide.imagePptxExportFailed,
+      renderToast: (progress) => <PptxProgressToast progress={progress} />,
+      run: (onProgress) => exportSlideAsImagePptx(slide, slideId, onProgress),
+    });
+  };
+
+  const exportMenuItems = (
+    <DropdownMenuGroup>
+      <DropdownMenuItem disabled={exporting} onClick={exportHtml}>
+        <FileCode2 />
+        {t.slide.exportAsHtml}
+      </DropdownMenuItem>
+      <DropdownMenuItem disabled={exporting} onClick={exportPdf}>
+        <FileText />
+        {t.slide.exportAsPdf}
+      </DropdownMenuItem>
+      <DropdownMenuSeparator />
+      <DropdownMenuItem disabled={exporting} onClick={exportPptx}>
+        <Presentation />
+        {t.slide.exportAsPptx}
+      </DropdownMenuItem>
+      <DropdownMenuItem disabled={exporting} onClick={exportImagePptx}>
+        <FileImage />
+        {t.slide.exportAsImagePptx}
+      </DropdownMenuItem>
+    </DropdownMenuGroup>
+  );
+
+  return (
+    <HistoryProvider pageIndex={index} onPageChange={goTo}>
+      <InspectorProvider
+        slideId={slideId}
+        pageIndex={index}
+        panelHidden={designOpen || agentOpen}
+        onPanelOpen={() => {
+          setDesignOpen(false);
+          setDockOpen(false);
+        }}
+      >
+        <SelectionReporter />
+        <div className="flex h-dvh flex-col overflow-hidden bg-sidebar text-foreground">
+          <header className="grid min-h-12 shrink-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-2 gap-y-1 px-2 py-2 md:px-3">
+            <div className="col-start-1 row-start-1 flex min-w-0 items-center gap-1.5 md:gap-2">
+              {showSlideBrowser && (
+                <button
+                  type="button"
+                  onClick={goBack}
+                  aria-label={t.slide.backToHome}
+                  title={t.slide.home}
+                  className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}
+                >
+                  <ChevronLeft className="size-4" />
+                </button>
+              )}
+              <span aria-hidden className="mx-0.5 hidden h-5 w-px bg-hairline md:block" />
+              {import.meta.env.DEV && (
+                <Tabs
+                  value={view}
+                  onValueChange={(next) => {
+                    setSearchParams(
+                      (prev) => {
+                        const params = new URLSearchParams(prev);
+                        if (next === 'assets') params.set('view', 'assets');
+                        else params.delete('view');
+                        return params;
+                      },
+                      { replace: true },
+                    );
+                  }}
+                >
+                  <TabsList>
+                    <TabsTrigger value="slides">{t.slide.slidesTab}</TabsTrigger>
+                    <TabsTrigger value="assets">{t.slide.assetsTab}</TabsTrigger>
+                  </TabsList>
+                </Tabs>
+              )}
+              {import.meta.env.DEV && <AgentConnectedBadge />}
+            </div>
+
+            <div className="col-span-3 row-start-2 flex min-w-0 justify-center sm:col-span-1 sm:col-start-2 sm:row-start-1">
+              <div className="min-w-0 max-w-[34rem]">
+                <InlineTitleEditor title={title} onSubmit={(next) => renameSlide(slideId, next)} />
+              </div>
+            </div>
+
+            <div className="col-start-3 row-start-1 flex items-center justify-end gap-1">
+              {view === 'slides' && !narrowToolbar && <InspectModeSwitcher />}
+              {import.meta.env.DEV && view === 'slides' && !compactToolbar && (
+                <span aria-hidden className="mx-0.5 hidden h-5 w-px bg-hairline md:block" />
+              )}
+              {view === 'slides' && !compactToolbar && (
+                <button
+                  type="button"
+                  aria-label={t.slide.copyLink}
+                  title={t.slide.copyLink}
+                  className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}
+                  onClick={copyLink}
+                >
+                  <span className="relative grid size-4 place-items-center">
+                    <Link2
+                      className={cn(
+                        'col-start-1 row-start-1 size-4 transition-opacity duration-200',
+                        linkCopied ? 'opacity-0' : 'opacity-100',
+                      )}
+                    />
+                    <Check
+                      className={cn(
+                        'col-start-1 row-start-1 size-4 transition-opacity duration-200',
+                        linkCopied ? 'opacity-100' : 'opacity-0',
+                      )}
+                    />
+                  </span>
+                </button>
+              )}
+              {view === 'slides' && allowHtmlDownload && !compactToolbar && (
+                <DropdownMenu>
+                  <DropdownMenuTrigger
+                    type="button"
+                    disabled={exporting}
+                    aria-label={t.slide.download}
+                    title={t.slide.download}
+                    className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}
+                  >
+                    {exporting ? (
+                      <Loader2 className="size-4 animate-spin motion-reduce:animate-none" />
+                    ) : (
+                      <Download className="size-4" />
+                    )}
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="min-w-[200px]">
+                    {exportMenuItems}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              )}
+              {view === 'slides' && compactToolbar && (
+                <DropdownMenu key={narrowToolbar ? 'narrow' : 'compact'}>
+                  <DropdownMenuTrigger
+                    type="button"
+                    aria-label={t.slide.moreActions}
+                    title={t.slide.moreActions}
+                    className={buttonVariants({ variant: 'ghost', size: 'icon-sm' })}
+                  >
+                    {exporting ? (
+                      <Loader2 className="size-4 animate-spin motion-reduce:animate-none" />
+                    ) : (
+                      <MoreHorizontal className="size-4" />
+                    )}
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="min-w-[200px]">
+                    {narrowToolbar && import.meta.env.DEV && (
+                      <EditorMenuItems
+                        designOpen={designOpen}
+                        onDesignToggle={() => setDesignOpen((v) => !v)}
+                      />
+                    )}
+                    <DropdownMenuGroup>
+                      {narrowToolbar && import.meta.env.DEV && (
+                        <DropdownMenuItem onClick={toggleAgent}>
+                          <Sparkles />
+                          {t.agent.openTitle}
+                        </DropdownMenuItem>
+                      )}
+                      <DropdownMenuItem onClick={() => setCommandOpen(true)}>
+                        <Terminal />
+                        {t.commandMenu.trigger}
+                      </DropdownMenuItem>
+                      <DropdownMenuItem onClick={copyLink}>
+                        <Link2 />
+                        {t.slide.copyLink}
+                      </DropdownMenuItem>
+                    </DropdownMenuGroup>
+                    {allowHtmlDownload && <DropdownMenuSeparator />}
+                    {allowHtmlDownload && exportMenuItems}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              )}
+              {import.meta.env.DEV && view === 'slides' && !narrowToolbar && <AgentToggleButton />}
+              {view === 'slides' && !narrowToolbar && (
+                <DesignToggleButton active={designOpen} onToggle={() => setDesignOpen((v) => !v)} />
+              )}
+              {view === 'slides' && !narrowToolbar && <InspectPanelButton />}
+              <span aria-hidden className="mx-0.5 hidden h-5 w-px bg-hairline md:block" />
+              {view === 'slides' && (
+                <div className="inline-flex items-stretch">
+                  <Button
+                    size="sm"
+                    variant="brand"
+                    aria-label={t.slide.present}
+                    onClick={() => present(isMobile ? 'window' : 'fullscreen')}
+                    className="rounded-r-none px-2.5 lg:px-3"
+                  >
+                    <Play className="size-3.5 fill-current" />
+                    <span className="hidden lg:inline">{t.slide.present}</span>
+                  </Button>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger
+                      type="button"
+                      aria-label={t.slide.presentMenuAria}
+                      title={t.slide.presentMenuAria}
+                      className={cn(
+                        buttonVariants({ variant: 'brand', size: 'sm' }),
+                        'rounded-l-none px-1.5 shadow-[inset_1px_0_0_oklch(0_0_0/0.12),inset_0_1px_0_oklch(1_0_0/0.18),0_1px_0_oklch(0_0_0/0.16)]',
+                      )}
+                    >
+                      <ChevronDown className="size-3.5" />
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" className="min-w-[200px]">
+                      <DropdownMenuGroup>
+                        <DropdownMenuItem onClick={() => present('window')}>
+                          <Play />
+                          {t.slide.presentInWindow}
+                          <DropdownMenuShortcut>↵</DropdownMenuShortcut>
+                        </DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => present('fullscreen')}>
+                          <Maximize />
+                          {t.slide.presentFullscreen}
+                          <DropdownMenuShortcut>F</DropdownMenuShortcut>
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onClick={() => {
+                            if (slideId) openPresenterWindow(slideId);
+                            present('window');
+                          }}
+                        >
+                          <MonitorSpeaker />
+                          {t.slide.presentPresenter}
+                          <DropdownMenuShortcut>P</DropdownMenuShortcut>
+                        </DropdownMenuItem>
+                      </DropdownMenuGroup>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </div>
+              )}
+            </div>
+          </header>
+
+          {view === 'assets' ? (
+            <div className="min-h-0 flex-1 overflow-hidden md:mx-2 md:mb-2 md:rounded-[10px] md:bg-background md:shadow-edge md:ring-1 md:ring-foreground/[0.06]">
+              <AssetView slideId={slideId} />
+            </div>
+          ) : (
+            <DesignProvider slideId={slideId}>
+              <div className="relative flex min-h-0 flex-1 flex-col">
+                <div className="flex min-h-0 flex-1 flex-col md:flex-row">
+                  <ResizableRail
+                    pages={pages}
+                    design={slide.design}
+                    current={index}
+                    onSelect={goTo}
+                    onReorder={import.meta.env.DEV ? reorderPage : undefined}
+                    actions={thumbnailActions}
+                    moduleTransition={slide.transition}
+                    onOverview={() => setOverviewOpen(true)}
+                  />
+                  <main
+                    ref={slideViewportRef}
+                    data-inspector-root
+                    data-slide-id={slideId}
+                    data-agent-provider={agentActivity?.provider}
+                    className="relative min-h-0 min-w-0 flex-1 bg-background p-2 md:mx-2 md:mb-2 md:rounded-[10px] md:p-10 md:shadow-edge md:ring-1 md:ring-foreground/[0.06]"
+                  >
+                    <SlideViewportNavigation
+                      targetRef={slideViewportRef}
+                      onPrev={() => goTo(index - 1)}
+                      onNext={() => goTo(index + 1)}
+                      canPrev={index > 0}
+                      canNext={index < pageCount - 1}
+                    />
+                    <SlideCanvas design={slide.design}>
+                      <SlideTransitionLayer
+                        pages={pages}
+                        index={index}
+                        total={pageCount}
+                        moduleTransition={slide.transition}
+                        disabled={prefersReducedMotion}
+                      />
+                    </SlideCanvas>
+                    <InspectOverlay />
+                    <InlineEditLayer />
+                    <SaveBar />
+                    {import.meta.env.DEV && <CommentLayer />}
+                    {agentActivity && <AgentPresence activity={agentActivity} revision={pages} />}
+                  </main>
+                  {/* Mobile-only horizontal rail. Sits below the canvas and
+                    pads its bottom for the iOS home indicator / Safari URL bar. */}
+                  <div
+                    className="shrink-0 border-t border-hairline md:hidden"
+                    style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}
+                  >
+                    <ThumbnailRail
+                      pages={pages}
+                      design={slide.design}
+                      current={index}
+                      onSelect={goTo}
+                      orientation="horizontal"
+                      actions={thumbnailActions}
+                    />
+                  </div>
+                  <EditorSidebar
+                    designOpen={designOpen}
+                    onCloseDesign={() => setDesignOpen(false)}
+                    agentOpen={agentOpen}
+                    agent={
+                      import.meta.env.DEV && (
+                        <SlideAgentDock
+                          slideId={slideId}
+                          slideTitle={title}
+                          pageNumber={index + 1}
+                          totalPages={pageCount}
+                        />
+                      )
+                    }
+                  />
+                </div>
+                {import.meta.env.DEV && (
+                  <NotesDrawer
+                    slideId={slideId}
+                    index={index}
+                    total={pageCount}
+                    initial={slide.notes?.[index]}
+                  />
+                )}
+                <OverviewGrid
+                  pages={pages}
+                  design={slide.design}
+                  open={overviewOpen}
+                  current={index}
+                  onClose={() => setOverviewOpen(false)}
+                  onSelect={goTo}
+                  variant="editor"
+                  moduleTransition={slide.transition}
+                />
+              </div>
+            </DesignProvider>
+          )}
+
+          {view === 'slides' && (
+            <SlideCommandMenu
+              open={commandOpen}
+              onOpenChange={setCommandOpen}
+              pageCount={pageCount}
+              currentIndex={index}
+              exporting={exporting}
+              handlers={{
+                onPresentWindow: () => present('window'),
+                onPresentFullscreen: () => present('fullscreen'),
+                onPresenterView: () => {
+                  if (slideId) openPresenterWindow(slideId);
+                  present('window');
+                },
+                onCopyLink: copyLink,
+                onOverview: () => setOverviewOpen(true),
+                onToggleDesignPanel: () => setDesignOpen((v) => !v),
+                onToggleAgentPanel: toggleAgent,
+                onExportHtml: exportHtml,
+                onExportPdf: exportPdf,
+                onExportPptx: exportPptx,
+                onExportImagePptx: exportImagePptx,
+                onGoToPage: goTo,
+              }}
+            />
+          )}
+        </div>
+        <PresentCurtain opaque={curtain !== null} className="fixed z-[1000]" />
+      </InspectorProvider>
+    </HistoryProvider>
+  );
+}
+
+const RAIL_WIDTH_STORAGE_KEY = 'open-slide:thumbnail-rail-width';
+const DEFAULT_RAIL_WIDTH = 264;
+const MIN_RAIL_WIDTH = 200;
+const MAX_RAIL_WIDTH = 480;
+
+function ResizableRail(props: {
+  pages: SlideModule['default'];
+  design?: SlideModule['design'];
+  current: number;
+  onSelect: (i: number) => void;
+  onReorder?: (from: number, to: number) => void;
+  actions?: ThumbnailActions;
+  moduleTransition?: SlideModule['transition'];
+  onOverview?: () => void;
+}) {
+  const t = useLocale();
+  const [width, setWidth] = useStoredWidth(
+    RAIL_WIDTH_STORAGE_KEY,
+    DEFAULT_RAIL_WIDTH,
+    MIN_RAIL_WIDTH,
+    MAX_RAIL_WIDTH,
+  );
+
+  return (
+    <div className="relative hidden shrink-0 md:block" style={{ width }}>
+      <ThumbnailRail width={width} {...props} />
+      <ResizeHandle
+        width={width}
+        min={MIN_RAIL_WIDTH}
+        max={MAX_RAIL_WIDTH}
+        defaultWidth={DEFAULT_RAIL_WIDTH}
+        edge="right"
+        label={t.thumbnailRail.resizeRail}
+        onResize={setWidth}
+        className="right-0 translate-x-1/2"
+      />
+    </div>
+  );
+}
+
+function EditorMenuItems({
+  designOpen,
+  onDesignToggle,
+}: {
+  designOpen: boolean;
+  onDesignToggle: () => void;
+}) {
+  const t = useLocale();
+  const { active, toggle, panelOpen, panelHidden, togglePanel } = useInspector();
+  return (
+    <>
+      <DropdownMenuGroup>
+        <DropdownMenuRadioGroup
+          value={active ? 'edit' : 'preview'}
+          onValueChange={(value) => {
+            if ((value === 'edit') !== active) toggle();
+          }}
+        >
+          <DropdownMenuRadioItem value="preview">{t.inspector.previewMode}</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="edit">{t.inspector.editMode}</DropdownMenuRadioItem>
+        </DropdownMenuRadioGroup>
+        <DropdownMenuCheckboxItem
+          checked={designOpen}
+          onCheckedChange={onDesignToggle}
+          closeOnClick
+        >
+          {t.stylePanel.designToggle}
+        </DropdownMenuCheckboxItem>
+        <DropdownMenuCheckboxItem
+          checked={active && panelOpen && !panelHidden}
+          onCheckedChange={togglePanel}
+          closeOnClick
+        >
+          {t.inspector.format}
+        </DropdownMenuCheckboxItem>
+      </DropdownMenuGroup>
+      <DropdownMenuSeparator />
+    </>
+  );
+}
+
+function SlideAgentDock({
+  slideId,
+  slideTitle,
+  pageNumber,
+  totalPages,
+}: {
+  slideId: string;
+  slideTitle: string;
+  pageNumber: number;
+  totalPages: number;
+}) {
+  const { selected, comments } = useInspector();
+  const context = useMemo<AgentTurnContext>(
+    () => ({
+      slideId,
+      slideTitle,
+      pageNumber,
+      totalPages,
+      pendingComments: comments.length,
+      selection: selected
+        ? {
+            line: selected.line,
+            column: selected.column,
+            tagName: selected.anchor.tagName.toLowerCase(),
+            text: (selected.anchor.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 120),
+          }
+        : null,
+    }),
+    [slideId, slideTitle, pageNumber, totalPages, comments.length, selected],
+  );
+  return <AgentPanel context={context} onClose={() => setDockOpen(false)} />;
+}
+
+function AgentConnectedBadge() {
+  const t = useLocale();
+  const connected = useAgentSocketConnected();
+  return (
+    <TooltipProvider delay={200}>
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <button
+              type="button"
+              aria-label={connected ? t.slide.agentConnected : t.slide.agentDisconnected}
+              className="ml-1 flex shrink-0 cursor-help items-center gap-1.5 rounded-[3px] border border-hairline bg-card px-1.5 py-0.5 text-[10.5px] text-foreground/85 outline-none transition-colors duration-150 hover:bg-muted/50 focus-visible:ring-2 focus-visible:ring-ring/30"
+            >
+              <span aria-hidden className="relative flex size-1.5 items-center justify-center">
+                {connected ? (
+                  <>
+                    <span className="absolute inline-flex size-full rounded-full bg-emerald-500 opacity-60 motion-safe:animate-ping" />
+                    <span className="relative inline-flex size-1.5 rounded-full bg-emerald-500" />
+                  </>
+                ) : (
+                  <span className="relative inline-flex size-1.5 rounded-full bg-rose-500" />
+                )}
+              </span>
+              <span className="hidden xl:inline">
+                {connected ? t.slide.agentConnected : t.slide.agentDisconnected}
+              </span>
+            </button>
+          }
+        />
+        <TooltipContent
+          side="bottom"
+          align="start"
+          className="w-max max-w-[min(520px,calc(100vw-2rem))] text-center leading-relaxed"
+        >
+          {connected ? t.slide.agentConnectedTooltip : t.slide.agentDisconnectedTooltip}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
+}
+
+function SelectionReporter() {
+  const { selected } = useInspector();
+  useEffect(() => {
+    if (!import.meta.hot) return;
+    const selection = selected
+      ? {
+          line: selected.line,
+          column: selected.column,
+          tagName: selected.anchor.tagName.toLowerCase(),
+          text: (selected.anchor.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 120),
+        }
+      : null;
+    import.meta.hot.send('open-slide:current', { selection });
+  }, [selected]);
+  return null;
+}
+
+function SlideViewportNavigation({
+  targetRef,
+  onPrev,
+  onNext,
+  canPrev,
+  canNext,
+}: {
+  targetRef: RefObject<HTMLElement | null>;
+  onPrev: () => void;
+  onNext: () => void;
+  canPrev: boolean;
+  canNext: boolean;
+}) {
+  const { mode, inlineEdit } = useInspector();
+  const isMobile = useIsMobile();
+  const editing = !!inlineEdit;
+  const browsing = mode === 'preview';
+
+  useWheelPageNavigation({
+    ref: targetRef,
+    enabled: browsing && !editing,
+    canPrev,
+    canNext,
+    onPrev,
+    onNext,
+  });
+
+  // Tap-to-navigate is a touch affordance — desktop has visible prev/next
+  // chrome, so it stays edge-only on small screens (matches the old md:hidden
+  // zones). Interactive slide content keeps its tap via the hook's passthrough.
+  useClickPageNavigation({
+    ref: targetRef,
+    enabled: isMobile && browsing && !editing,
+    edgeRatio: 0.18,
+    canPrev,
+    canNext,
+    onPrev,
+    onNext,
+  });
+
+  return null;
+}
+
+function InlineTitleEditor({
+  title,
+  onSubmit,
+}: {
+  title: string;
+  onSubmit: (name: string) => Promise<void> | void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState(title);
+  const [saving, setSaving] = useState(false);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const t = useLocale();
+
+  useEffect(() => {
+    if (!editing) setValue(title);
+  }, [title, editing]);
+
+  useEffect(() => {
+    if (editing) {
+      queueMicrotask(() => {
+        inputRef.current?.focus();
+        inputRef.current?.select();
+      });
+    }
+  }, [editing]);
+
+  const commit = async () => {
+    const trimmed = value.trim();
+    if (!trimmed || trimmed === title) {
+      setValue(title);
+      setEditing(false);
+      return;
+    }
+    setSaving(true);
+    try {
+      await onSubmit(trimmed);
+      setEditing(false);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const cancel = () => {
+    setValue(title);
+    setEditing(false);
+  };
+
+  if (editing) {
+    return (
+      <div className="flex min-w-0 flex-1 items-center justify-center">
+        <div className="inline-grid max-w-full items-center">
+          <span
+            aria-hidden
+            className="invisible col-start-1 row-start-1 overflow-hidden whitespace-pre border border-transparent px-2 py-0.5 font-heading text-[13.5px] font-semibold tracking-[-0.01em]"
+          >
+            {value || ' '}
+          </span>
+          <input
+            ref={inputRef}
+            size={1}
+            value={value}
+            disabled={saving}
+            onChange={(e) => setValue(e.target.value)}
+            onBlur={() => {
+              if (!saving) commit();
+            }}
+            onKeyDown={(e) => {
+              if (e.nativeEvent.isComposing) return;
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                commit();
+              } else if (e.key === 'Escape') {
+                e.preventDefault();
+                cancel();
+              }
+            }}
+            maxLength={80}
+            className="col-start-1 row-start-1 w-full min-w-0 rounded-[5px] border border-foreground/30 bg-card px-2 py-0.5 text-center font-heading text-[13.5px] font-semibold tracking-[-0.01em] outline-none"
+          />
+        </div>
+      </div>
+    );
+  }
+
+  if (!import.meta.env.DEV) {
+    return (
+      <div className="flex min-w-0 items-baseline justify-center">
+        <h1 className="truncate font-heading text-[13.5px] font-semibold tracking-[-0.01em]">
+          {title}
+        </h1>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex min-w-0 items-center justify-center">
+      <button
+        type="button"
+        onClick={() => setEditing(true)}
+        aria-label={t.slide.renameSlide}
+        className={cn(
+          'min-w-0 max-w-full cursor-text rounded-[5px] border border-transparent px-2 py-0.5 transition-colors duration-100',
+          'hover:border-foreground/30 hover:bg-card focus-visible:border-foreground/30 focus-visible:bg-card focus-visible:outline-none',
+        )}
+      >
+        <h1 className="truncate font-heading text-[13.5px] font-semibold tracking-[-0.01em]">
+          {title}
+        </h1>
+      </button>
+    </div>
+  );
+}
